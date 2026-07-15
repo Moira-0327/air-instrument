@@ -4,6 +4,15 @@ A webcam hand-tracking musical instrument. **Right hand** plays chords + draws
 calligraphic ink; **left hand** triggers drums. Built with MediaPipe Hands +
 Three.js. **Single file, no build step.**
 
+## Try it live
+
+**▶ https://moira-0327.github.io/air-instrument/** — open on any device, allow
+the camera, and raise your hands.
+
+<img src="qr.png" alt="QR code to the live demo" width="200" />
+
+_Scan the QR to open the demo on your phone._
+
 ## Run it (30 seconds)
 
 You have internet? That's all you need.
