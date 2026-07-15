@@ -1,0 +1,1142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Air Instrument — hand-tracked synth + generative ink</title>
+  <meta name="description" content="A webcam hand-tracking musical instrument. Right hand plays chords + draws calligraphic ink; left hand triggers drums. Built with MediaPipe Hands + Three.js. Single-file, no build step." />
+
+  <!-- three.js (+ addons) via import map -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <!-- MediaPipe Hands (UMD globals: window.Hands, window.Camera) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js" crossorigin="anonymous"></script>
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+    #container { position: absolute; inset: 0; }
+    #video { position: absolute; width: 0; height: 0; opacity: 0; pointer-events: none; }
+
+    /* Start / status overlay */
+    #overlay {
+      position: absolute; inset: 0; z-index: 10;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 18px; cursor: pointer;
+      background: radial-gradient(ellipse at center, #0b0b12 0%, #000 70%);
+      color: #cdd6f4; font-family: Georgia, "Times New Roman", serif; text-align: center;
+      transition: opacity 0.6s ease;
+    }
+    #overlay h1 { font-size: clamp(28px, 5vw, 54px); font-weight: 400; letter-spacing: 0.06em; }
+    #overlay p  { font-size: 14px; max-width: 460px; line-height: 1.6; opacity: 0.65; font-family: ui-monospace, monospace; }
+    #overlay .cta {
+      margin-top: 8px; padding: 12px 30px; border: 1px solid #45568a; border-radius: 999px;
+      font-family: ui-monospace, monospace; font-size: 14px; letter-spacing: 0.08em;
+      transition: background 0.2s, border-color 0.2s;
+    }
+    #overlay:hover .cta { background: rgba(69, 86, 138, 0.2); border-color: #6a8cd2; }
+    #overlay.hidden { opacity: 0; pointer-events: none; }
+    #overlay.loading .cta { opacity: 0.5; }
+    #err { color: #f38ba8; font-family: ui-monospace, monospace; font-size: 13px; max-width: 460px; }
+  </style>
+</head>
+<body>
+  <video id="video" autoplay playsinline muted></video>
+  <div id="container"></div>
+
+  <div id="overlay">
+    <h1>Air&nbsp;Instrument</h1>
+    <p>Right hand = chords + calligraphic ink. Left hand = drums (raise/lower for hat / snare / kick). Pinch your right thumb &amp; index to shape the filter.</p>
+    <div class="cta">Click to start &nbsp;·&nbsp; allow camera</div>
+    <div id="err"></div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+    // ================================================================
+    // CONSTANTS
+    // ================================================================
+    const NOTE_FREQUENCIES = {
+      'C3': 130.81, 'D3': 146.83, 'E3': 164.81, 'F3': 174.61, 'G3': 196.00, 'A3': 220.00, 'B3': 246.94,
+      'C4': 261.63, 'D4': 293.66, 'E4': 329.63, 'F4': 349.23, 'G4': 392.00, 'A4': 440.00, 'B4': 493.88,
+      'C5': 523.25, 'D5': 587.33, 'E5': 659.25, 'F5': 698.46, 'G5': 783.99, 'A5': 880.00, 'B5': 987.77,
+    };
+    const CHORD_INTERVALS = {
+      major:   [0, 4, 7, 12],
+      minor:   [0, 3, 7, 12],
+      seventh: [0, 4, 7, 10],
+    };
+    const ROOT_NOTES = ['C', 'D', 'E', 'F', 'G', 'A', 'B'];
+    const BEAT_PATTERNS = {
+      hat:   [1, 0, 1, 0, 1, 0, 1, 0],
+      snare: [0, 0, 1, 0, 0, 0, 1, 0],
+      kick:  [1, 0, 0, 1, 1, 0, 0, 0],
+    };
+    const MAX_INK_AGE = 600;
+
+    // ================================================================
+    // SUBSYSTEM: Video background
+    // ================================================================
+    class VideoBackground {
+      constructor(video) { this.video = video; }
+      init(scene) {
+        this.texture = new THREE.VideoTexture(this.video);
+        this.texture.minFilter = THREE.LinearFilter;
+        this.texture.magFilter = THREE.LinearFilter;
+        this.texture.colorSpace = THREE.SRGBColorSpace;
+        const geo = new THREE.PlaneGeometry(1, 1);
+        const mat = new THREE.MeshBasicMaterial({ map: this.texture, side: THREE.DoubleSide });
+        this.mesh = new THREE.Mesh(geo, mat);
+        this.mesh.position.z = -10;
+        this.mesh.renderOrder = 0;
+        scene.add(this.mesh);
+      }
+      update(state) {
+        const { width, height } = state;
+        // Mirror horizontally via negative x-scale, negative y for y-down camera
+        this.mesh.scale.set(-width, -height, 1);
+        this.mesh.position.set(width / 2, height / 2, -10);
+      }
+      dispose() {
+        this.texture.dispose();
+        this.mesh.material.dispose();
+        this.mesh.geometry.dispose();
+      }
+    }
+
+    // ================================================================
+    // SUBSYSTEM: Calligraphic ink trail
+    // ================================================================
+    const IT_MAX_VERTS = 48000;
+    const IT_SUBDIVISIONS = 4;
+    const IT_NIB_ANGLE = Math.PI * 0.35;
+    const IT_MAX_WIDTH = 5.5;
+    const IT_MIN_WIDTH = 0.4;
+    const IT_STROKE_GAP = 50;
+    const INK_DARK   = new THREE.Color(10 / 255, 10 / 255, 12 / 255);
+    const INK_MEDIUM = new THREE.Color(30 / 255, 30 / 255, 35 / 255);
+    const INK_LIGHT  = new THREE.Color(60 / 255, 60 / 255, 65 / 255);
+
+    const calliVertShader = `
+      attribute vec4 aColor;
+      attribute float aEdge;
+      varying vec4 vColor;
+      varying float vEdge;
+      void main() {
+        vColor = aColor;
+        vEdge = aEdge;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `;
+    const calliFragShader = `
+      varying vec4 vColor;
+      varying float vEdge;
+      void main() {
+        float absEdge = abs(vEdge);
+        float edgeFade = 1.0 - smoothstep(0.6, 1.0, absEdge);
+        float pooling = 1.0 + 0.12 * (1.0 - absEdge);
+        float alpha = vColor.a * edgeFade;
+        if (alpha < 0.001) discard;
+        gl_FragColor = vec4(vColor.rgb * pooling, alpha);
+      }
+    `;
+
+    function catmullRom(p0, p1, p2, p3, t) {
+      const t2 = t * t, t3 = t2 * t;
+      const interp = (a, b, c, d) =>
+        0.5 * ((2 * b) + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
+      return {
+        x: interp(p0.x, p1.x, p2.x, p3.x),
+        y: interp(p0.y, p1.y, p2.y, p3.y),
+        age: interp(p0.age, p1.age, p2.age, p3.age),
+        pressure: interp(p0.pressure, p1.pressure, p2.pressure, p3.pressure),
+        velocity: interp(p0.velocity, p1.velocity, p2.velocity, p3.velocity),
+      };
+    }
+    function splitStrokes(points) {
+      const strokes = [];
+      let current = [];
+      for (let i = 0; i < points.length; i++) {
+        if (current.length > 0) {
+          const prev = current[current.length - 1];
+          const dx = points[i].x - prev.x;
+          const dy = points[i].y - prev.y;
+          if (Math.sqrt(dx * dx + dy * dy) > IT_STROKE_GAP) {
+            if (current.length >= 2) strokes.push(current);
+            current = [];
+          }
+        }
+        current.push(points[i]);
+      }
+      if (current.length >= 2) strokes.push(current);
+      return strokes;
+    }
+    function subdivideStroke(stroke) {
+      if (stroke.length < 2) return stroke;
+      const out = [];
+      out.push(stroke[0]);
+      for (let i = 0; i < stroke.length - 1; i++) {
+        const p0 = stroke[Math.max(0, i - 1)];
+        const p1 = stroke[i];
+        const p2 = stroke[i + 1];
+        const p3 = stroke[Math.min(stroke.length - 1, i + 2)];
+        for (let s = 1; s <= IT_SUBDIVISIONS; s++) {
+          out.push(catmullRom(p0, p1, p2, p3, s / IT_SUBDIVISIONS));
+        }
+      }
+      return out;
+    }
+    function calliWidth(angle, velocity, pressure) {
+      const angleFactor = Math.abs(Math.sin(angle - IT_NIB_ANGLE));
+      const velFactor = Math.max(0.1, 1 - velocity / 50);
+      const pressFactor = Math.max(0.15, Math.min(1, pressure));
+      return IT_MIN_WIDTH + (IT_MAX_WIDTH - IT_MIN_WIDTH) * angleFactor * velFactor * pressFactor;
+    }
+
+    class InkTrailSystem {
+      init(scene) {
+        this.ribbonGeo = new THREE.BufferGeometry();
+        const positions = new Float32Array(IT_MAX_VERTS * 3);
+        const colors = new Float32Array(IT_MAX_VERTS * 4);
+        const edges = new Float32Array(IT_MAX_VERTS);
+        this.posAttr = new THREE.BufferAttribute(positions, 3); this.posAttr.setUsage(THREE.DynamicDrawUsage);
+        this.colorAttr = new THREE.BufferAttribute(colors, 4); this.colorAttr.setUsage(THREE.DynamicDrawUsage);
+        this.edgeAttr = new THREE.BufferAttribute(edges, 1); this.edgeAttr.setUsage(THREE.DynamicDrawUsage);
+        this.ribbonGeo.setAttribute('position', this.posAttr);
+        this.ribbonGeo.setAttribute('aColor', this.colorAttr);
+        this.ribbonGeo.setAttribute('aEdge', this.edgeAttr);
+        this.ribbonGeo.setDrawRange(0, 0);
+        const ribbonMat = new THREE.ShaderMaterial({
+          vertexShader: calliVertShader, fragmentShader: calliFragShader,
+          transparent: true, depthWrite: false, side: THREE.DoubleSide,
+        });
+        this.ribbonMesh = new THREE.Mesh(this.ribbonGeo, ribbonMat);
+        this.ribbonMesh.position.z = 1; this.ribbonMesh.renderOrder = 3; this.ribbonMesh.frustumCulled = false;
+        scene.add(this.ribbonMesh);
+
+        const maxHairlineVerts = 600;
+        this.hairlinePositions = new Float32Array(maxHairlineVerts * 3);
+        this.hairlineGeo = new THREE.BufferGeometry();
+        const hpAttr = new THREE.BufferAttribute(this.hairlinePositions, 3); hpAttr.setUsage(THREE.DynamicDrawUsage);
+        this.hairlineGeo.setAttribute('position', hpAttr);
+        this.hairlineGeo.setDrawRange(0, 0);
+        const hairlineMat = new THREE.LineBasicMaterial({ color: INK_LIGHT, transparent: true, opacity: 0.25, depthWrite: false });
+        this.hairlineLine = new THREE.Line(this.hairlineGeo, hairlineMat);
+        this.hairlineLine.position.z = 1; this.hairlineLine.renderOrder = 4; this.hairlineLine.frustumCulled = false;
+        scene.add(this.hairlineLine);
+
+        const maxFlicker = 15;
+        this.flickerPositions = new Float32Array(maxFlicker * 3);
+        this.flickerColors = new Float32Array(maxFlicker * 4);
+        this.flickerGeo = new THREE.BufferGeometry();
+        const fpAttr = new THREE.BufferAttribute(this.flickerPositions, 3); fpAttr.setUsage(THREE.DynamicDrawUsage);
+        const fcAttr = new THREE.BufferAttribute(this.flickerColors, 4); fcAttr.setUsage(THREE.DynamicDrawUsage);
+        this.flickerGeo.setAttribute('position', fpAttr);
+        this.flickerGeo.setAttribute('color', fcAttr);
+        this.flickerGeo.setDrawRange(0, 0);
+        const flickerMat = new THREE.PointsMaterial({ size: 6, vertexColors: true, transparent: true, depthWrite: false, sizeAttenuation: false });
+        this.flickerPoints = new THREE.Points(this.flickerGeo, flickerMat);
+        this.flickerPoints.position.z = 1; this.flickerPoints.renderOrder = 3; this.flickerPoints.frustumCulled = false;
+        scene.add(this.flickerPoints);
+      }
+      update(state) {
+        const points = state.inkPoints;
+        const strokes = splitStrokes(points);
+        this.updateCalligraphicRibbon(strokes);
+        this.updateHairline(strokes);
+        this.updateFlicker(points, state.flicker);
+      }
+      updateCalligraphicRibbon(strokes) {
+        const pos = this.posAttr.array, col = this.colorAttr.array, edge = this.edgeAttr.array;
+        let vi = 0;
+        for (const stroke of strokes) {
+          const curve = subdivideStroke(stroke);
+          if (curve.length < 2) continue;
+          for (let i = 1; i < curve.length && vi + 6 <= IT_MAX_VERTS; i++) {
+            const prev = curve[i - 1], curr = curve[i];
+            const dx = curr.x - prev.x, dy = curr.y - prev.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < 0.01) continue;
+            const ageFactor = 1 - curr.age / MAX_INK_AGE;
+            const opacity = Math.min(1, ageFactor * Math.max(0.15, curr.pressure) * 1.4);
+            if (opacity <= 0) continue;
+            const angle = Math.atan2(dy, dx);
+            const width = calliWidth(angle, Math.max(0, curr.velocity), curr.pressure);
+            const halfW = width / 2;
+            const nx = (-dy / dist) * halfW, ny = (dx / dist) * halfW;
+            const thickRatio = (width - IT_MIN_WIDTH) / (IT_MAX_WIDTH - IT_MIN_WIDTH);
+            const inkR = INK_DARK.r + (INK_MEDIUM.r - INK_DARK.r) * (1 - thickRatio) * 0.5;
+            const inkG = INK_DARK.g + (INK_MEDIUM.g - INK_DARK.g) * (1 - thickRatio) * 0.5;
+            const inkB = INK_DARK.b + (INK_MEDIUM.b - INK_DARK.b) * (1 - thickRatio) * 0.5;
+            const base3 = vi * 3, base4 = vi * 4;
+            pos[base3 + 0] = prev.x - nx; pos[base3 + 1] = prev.y - ny; pos[base3 + 2] = 0;
+            pos[base3 + 3] = prev.x + nx; pos[base3 + 4] = prev.y + ny; pos[base3 + 5] = 0;
+            pos[base3 + 6] = curr.x - nx; pos[base3 + 7] = curr.y - ny; pos[base3 + 8] = 0;
+            pos[base3 + 9]  = prev.x + nx; pos[base3 + 10] = prev.y + ny; pos[base3 + 11] = 0;
+            pos[base3 + 12] = curr.x + nx; pos[base3 + 13] = curr.y + ny; pos[base3 + 14] = 0;
+            pos[base3 + 15] = curr.x - nx; pos[base3 + 16] = curr.y - ny; pos[base3 + 17] = 0;
+            edge[vi + 0] = -1; edge[vi + 1] = 1; edge[vi + 2] = -1;
+            edge[vi + 3] = 1;  edge[vi + 4] = 1; edge[vi + 5] = -1;
+            for (let v = 0; v < 6; v++) {
+              col[base4 + v * 4 + 0] = inkR; col[base4 + v * 4 + 1] = inkG;
+              col[base4 + v * 4 + 2] = inkB; col[base4 + v * 4 + 3] = opacity;
+            }
+            vi += 6;
+          }
+        }
+        for (let j = vi * 3; j < Math.min(vi * 3 + 18, pos.length); j++) pos[j] = 0;
+        for (let j = vi * 4; j < Math.min(vi * 4 + 24, col.length); j++) col[j] = 0;
+        for (let j = vi; j < Math.min(vi + 6, edge.length); j++) edge[j] = 0;
+        this.ribbonGeo.setDrawRange(0, vi);
+        this.posAttr.needsUpdate = true; this.colorAttr.needsUpdate = true; this.edgeAttr.needsUpdate = true;
+      }
+      updateHairline(strokes) {
+        const maxVerts = this.hairlinePositions.length / 3;
+        let vertIdx = 0;
+        for (const stroke of strokes) {
+          const recent = stroke.slice(-80);
+          if (recent.length < 3) continue;
+          const curve = subdivideStroke(recent);
+          for (let i = 0; i < curve.length && vertIdx < maxVerts; i++) {
+            const p = curve[i];
+            const ageFactor = 1 - p.age / MAX_INK_AGE;
+            if (ageFactor < 0.3) continue;
+            let offX = 1.5, offY = 0;
+            if (i > 0) {
+              const dx = p.x - curve[i - 1].x, dy = p.y - curve[i - 1].y;
+              const d = Math.sqrt(dx * dx + dy * dy);
+              if (d > 0.01) { offX = (-dy / d) * 1.5; offY = (dx / d) * 1.5; }
+            }
+            this.hairlinePositions[vertIdx * 3] = p.x + offX;
+            this.hairlinePositions[vertIdx * 3 + 1] = p.y + offY;
+            this.hairlinePositions[vertIdx * 3 + 2] = 0;
+            vertIdx++;
+          }
+        }
+        if (vertIdx > 0) this.hairlineLine.material.opacity = 0.25;
+        this.hairlineGeo.setDrawRange(0, vertIdx);
+        this.hairlineGeo.attributes.position.needsUpdate = true;
+      }
+      updateFlicker(points, flicker) {
+        if (!flicker.active || points.length === 0) { this.flickerGeo.setDrawRange(0, 0); return; }
+        const recent = points.slice(-15);
+        for (let i = 0; i < recent.length && i < 15; i++) {
+          this.flickerPositions[i * 3] = recent[i].x;
+          this.flickerPositions[i * 3 + 1] = recent[i].y;
+          this.flickerPositions[i * 3 + 2] = 0;
+          this.flickerColors[i * 4] = INK_MEDIUM.r;
+          this.flickerColors[i * 4 + 1] = INK_MEDIUM.g;
+          this.flickerColors[i * 4 + 2] = INK_MEDIUM.b;
+          this.flickerColors[i * 4 + 3] = flicker.intensity * 0.5;
+        }
+        this.flickerGeo.setDrawRange(0, recent.length);
+        this.flickerGeo.attributes.position.needsUpdate = true;
+        this.flickerGeo.attributes.color.needsUpdate = true;
+      }
+      dispose() {
+        this.ribbonGeo.dispose(); this.ribbonMesh.material.dispose();
+        this.hairlineGeo.dispose(); this.hairlineLine.material.dispose();
+        this.flickerGeo.dispose(); this.flickerPoints.material.dispose();
+      }
+    }
+
+    // ================================================================
+    // SUBSYSTEM: Ink dots (splatter)
+    // ================================================================
+    const DOT_MAX = 2000;
+    const dotVertShader = `
+      attribute float aSize;
+      attribute float aOpacity;
+      varying float vOpacity;
+      void main() {
+        vOpacity = aOpacity;
+        vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+        gl_PointSize = aSize;
+        gl_Position = projectionMatrix * mvPos;
+      }
+    `;
+    const dotFragShader = `
+      varying float vOpacity;
+      uniform vec3 uColor;
+      void main() {
+        vec2 c = gl_PointCoord - 0.5;
+        if (dot(c, c) > 0.25) discard;
+        gl_FragColor = vec4(uColor, vOpacity);
+      }
+    `;
+    const DOT_INK = new THREE.Color(20 / 255, 40 / 255, 100 / 255);
+
+    class InkDotSystem {
+      init(scene) {
+        this.geo = new THREE.BufferGeometry();
+        const positions = new Float32Array(DOT_MAX * 3);
+        const sizes = new Float32Array(DOT_MAX);
+        const opacities = new Float32Array(DOT_MAX);
+        this.posAttr = new THREE.BufferAttribute(positions, 3); this.posAttr.setUsage(THREE.DynamicDrawUsage);
+        this.sizeAttr = new THREE.BufferAttribute(sizes, 1); this.sizeAttr.setUsage(THREE.DynamicDrawUsage);
+        this.opacityAttr = new THREE.BufferAttribute(opacities, 1); this.opacityAttr.setUsage(THREE.DynamicDrawUsage);
+        this.geo.setAttribute('position', this.posAttr);
+        this.geo.setAttribute('aSize', this.sizeAttr);
+        this.geo.setAttribute('aOpacity', this.opacityAttr);
+        this.geo.setDrawRange(0, 0);
+        const mat = new THREE.ShaderMaterial({
+          vertexShader: dotVertShader, fragmentShader: dotFragShader,
+          transparent: true, depthWrite: false, uniforms: { uColor: { value: DOT_INK } },
+        });
+        this.points = new THREE.Points(this.geo, mat);
+        this.points.position.z = 2; this.points.renderOrder = 4; this.points.frustumCulled = false;
+        scene.add(this.points);
+      }
+      update(state) {
+        const dots = state.inkDots;
+        const pos = this.posAttr.array, sizes = this.sizeAttr.array, opacities = this.opacityAttr.array;
+        const count = Math.min(dots.length, DOT_MAX);
+        for (let i = 0; i < count; i++) {
+          const d = dots[i];
+          pos[i * 3] = d.x; pos[i * 3 + 1] = d.y; pos[i * 3 + 2] = 0;
+          const opacity = Math.max(0, 0.8 * (1 - d.age / 400));
+          const radius = Math.max(0.5, d.size * (1 - d.age / 800));
+          sizes[i] = radius * 2;
+          opacities[i] = opacity;
+        }
+        this.geo.setDrawRange(0, count);
+        this.posAttr.needsUpdate = true; this.sizeAttr.needsUpdate = true; this.opacityAttr.needsUpdate = true;
+      }
+      dispose() { this.geo.dispose(); this.points.material.dispose(); }
+    }
+
+    // ================================================================
+    // SUBSYSTEM: Technical lines
+    // ================================================================
+    const TL_MAX_LINES = 500;
+    const TL_MAX_VERTS = TL_MAX_LINES * 2;
+    const lineVertShader = `
+      attribute float aOpacity;
+      attribute float aDashed;
+      varying float vOpacity;
+      varying float vDashed;
+      varying vec2 vPos;
+      void main() {
+        vOpacity = aOpacity;
+        vDashed = aDashed;
+        vec4 p = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        vPos = position.xy;
+        gl_Position = p;
+      }
+    `;
+    const lineFragShader = `
+      varying float vOpacity;
+      varying float vDashed;
+      varying vec2 vPos;
+      uniform vec3 uColor;
+      void main() {
+        if (vOpacity < 0.001) discard;
+        if (vDashed > 0.5) {
+          float d = mod(vPos.x + vPos.y, 8.0);
+          if (d > 4.0) discard;
+        }
+        gl_FragColor = vec4(uColor, vOpacity);
+      }
+    `;
+
+    class TechnicalLineSystem {
+      init(scene) {
+        this.geo = new THREE.BufferGeometry();
+        const positions = new Float32Array(TL_MAX_VERTS * 3);
+        const opacities = new Float32Array(TL_MAX_VERTS);
+        const dashed = new Float32Array(TL_MAX_VERTS);
+        this.posAttr = new THREE.BufferAttribute(positions, 3); this.posAttr.setUsage(THREE.DynamicDrawUsage);
+        this.opacityAttr = new THREE.BufferAttribute(opacities, 1); this.opacityAttr.setUsage(THREE.DynamicDrawUsage);
+        this.dashedAttr = new THREE.BufferAttribute(dashed, 1); this.dashedAttr.setUsage(THREE.DynamicDrawUsage);
+        this.geo.setAttribute('position', this.posAttr);
+        this.geo.setAttribute('aOpacity', this.opacityAttr);
+        this.geo.setAttribute('aDashed', this.dashedAttr);
+        this.geo.setDrawRange(0, 0);
+        const mat = new THREE.ShaderMaterial({
+          vertexShader: lineVertShader, fragmentShader: lineFragShader,
+          transparent: true, depthWrite: false,
+          uniforms: { uColor: { value: new THREE.Color(40 / 255, 50 / 255, 70 / 255) } },
+        });
+        this.lineSegments = new THREE.LineSegments(this.geo, mat);
+        this.lineSegments.position.z = 0; this.lineSegments.renderOrder = 2; this.lineSegments.frustumCulled = false;
+        scene.add(this.lineSegments);
+      }
+      update(state) {
+        const lines = state.technicalLines;
+        const pos = this.posAttr.array, opacities = this.opacityAttr.array, dashedArr = this.dashedAttr.array;
+        const count = Math.min(lines.length, TL_MAX_LINES);
+        for (let i = 0; i < count; i++) {
+          const l = lines[i];
+          const vi = i * 2;
+          const opacity = Math.max(0, 0.8 * (1 - l.age / 350));
+          const isDashed = l.style === 'dashed' ? 1.0 : 0.0;
+          pos[vi * 3] = l.x1; pos[vi * 3 + 1] = l.y1; pos[vi * 3 + 2] = 0;
+          pos[(vi + 1) * 3] = l.x2; pos[(vi + 1) * 3 + 1] = l.y2; pos[(vi + 1) * 3 + 2] = 0;
+          opacities[vi] = opacity; opacities[vi + 1] = opacity;
+          dashedArr[vi] = isDashed; dashedArr[vi + 1] = isDashed;
+        }
+        this.geo.setDrawRange(0, count * 2);
+        this.posAttr.needsUpdate = true; this.opacityAttr.needsUpdate = true; this.dashedAttr.needsUpdate = true;
+      }
+      dispose() { this.geo.dispose(); this.lineSegments.material.dispose(); }
+    }
+
+    // ================================================================
+    // SUBSYSTEM: Text labels
+    // ================================================================
+    const LABELS = [
+      { text: 'Major', font: '9px Georgia, serif', color: 'rgba(40, 70, 140, 0.25)', xFn: w => w - 15, yFn: h => h * 0.17, align: 'right' },
+      { text: 'Minor', font: '9px Georgia, serif', color: 'rgba(40, 70, 140, 0.25)', xFn: w => w - 15, yFn: h => h * 0.5, align: 'right' },
+      { text: '7th', font: '9px Georgia, serif', color: 'rgba(40, 70, 140, 0.25)', xFn: w => w - 15, yFn: h => h * 0.83, align: 'right' },
+      { text: 'Hi-Hat', font: '9px Georgia, serif', color: 'rgba(40, 70, 140, 0.25)', xFn: () => 15, yFn: h => h * 0.17, align: 'left' },
+      { text: 'Snare', font: '9px Georgia, serif', color: 'rgba(40, 70, 140, 0.25)', xFn: () => 15, yFn: h => h * 0.5, align: 'left' },
+      { text: 'Kick', font: '9px Georgia, serif', color: 'rgba(40, 70, 140, 0.25)', xFn: () => 15, yFn: h => h * 0.83, align: 'left' },
+      { text: 'fervor of life', font: '8px serif', color: 'rgba(80, 120, 180, 0.15)', xFn: w => w - 80, yFn: h => h * 0.12, align: 'left' },
+      { text: 'reality', font: '8px serif', color: 'rgba(80, 120, 180, 0.15)', xFn: w => w - 60, yFn: h => h * 0.35, align: 'left' },
+      { text: 'meaning', font: '8px serif', color: 'rgba(80, 120, 180, 0.15)', xFn: () => 20, yFn: h => h * 0.65, align: 'left' },
+      { text: 'individuals', font: '8px serif', color: 'rgba(80, 120, 180, 0.15)', xFn: () => 25, yFn: h => h * 0.88, align: 'left' },
+    ];
+
+    class TextLabelSystem {
+      constructor() { this.sprites = []; this.textures = []; this.lastWidth = 0; this.lastHeight = 0; }
+      init(scene) {
+        for (const label of LABELS) {
+          const canvas = document.createElement('canvas');
+          canvas.width = 256; canvas.height = 32;
+          const ctx = canvas.getContext('2d');
+          ctx.font = label.font; ctx.fillStyle = label.color; ctx.textBaseline = 'middle';
+          if (label.align === 'right') { ctx.textAlign = 'right'; ctx.fillText(label.text, 250, 16); }
+          else if (label.align === 'center') { ctx.textAlign = 'center'; ctx.fillText(label.text, 128, 16); }
+          else { ctx.textAlign = 'left'; ctx.fillText(label.text, 6, 16); }
+          const texture = new THREE.CanvasTexture(canvas);
+          texture.minFilter = THREE.LinearFilter;
+          this.textures.push(texture);
+          const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false });
+          const sprite = new THREE.Sprite(mat);
+          sprite.scale.set(128, 16, 1); sprite.position.z = 3; sprite.renderOrder = 8;
+          scene.add(sprite);
+          this.sprites.push(sprite);
+        }
+      }
+      update(state) {
+        const { width, height } = state;
+        if (width === this.lastWidth && height === this.lastHeight) return;
+        this.lastWidth = width; this.lastHeight = height;
+        for (let i = 0; i < LABELS.length; i++) {
+          const def = LABELS[i], sprite = this.sprites[i];
+          sprite.position.x = def.xFn(width);
+          sprite.position.y = def.yFn(height);
+        }
+      }
+      dispose() {
+        for (const tex of this.textures) tex.dispose();
+        for (const sprite of this.sprites) sprite.material.dispose();
+      }
+    }
+
+    // ================================================================
+    // SUBSYSTEM: Cursors (hand indicators)
+    // ================================================================
+    const C_INK_DARK   = new THREE.Color(20 / 255, 40 / 255, 100 / 255);
+    const C_INK_MEDIUM = new THREE.Color(40 / 255, 70 / 255, 140 / 255);
+    const C_INK_LIGHT  = new THREE.Color(80 / 255, 120 / 255, 180 / 255);
+    const C_BEAT_BLUE  = new THREE.Color(70 / 255, 140 / 255, 210 / 255);
+
+    class CursorSystem {
+      constructor() { this.lastChordLabel = ''; this.lastZoneLabel = ''; }
+      init(scene) { this.initRightHand(scene); this.initLeftHand(scene); }
+      initRightHand(scene) {
+        this.rightGroup = new THREE.Group();
+        this.rightGroup.visible = false; this.rightGroup.renderOrder = 10;
+        const ringGeo = new THREE.BufferGeometry();
+        const ringVerts = 65;
+        const ringPositions = new Float32Array(ringVerts * 3);
+        for (let i = 0; i < ringVerts; i++) {
+          const angle = (i / (ringVerts - 1)) * Math.PI * 2;
+          ringPositions[i * 3] = Math.cos(angle); ringPositions[i * 3 + 1] = Math.sin(angle); ringPositions[i * 3 + 2] = 0;
+        }
+        ringGeo.setAttribute('position', new THREE.BufferAttribute(ringPositions, 3));
+        const ringMat = new THREE.LineBasicMaterial({ color: C_INK_MEDIUM, transparent: true, opacity: 0.5, depthWrite: false });
+        this.outerRing = new THREE.Line(ringGeo, ringMat);
+        this.rightGroup.add(this.outerRing);
+        const fillGeo = new THREE.CircleGeometry(1, 32);
+        const fillMat = new THREE.MeshBasicMaterial({ color: C_INK_LIGHT, transparent: true, opacity: 0.1, depthWrite: false });
+        this.innerFill = new THREE.Mesh(fillGeo, fillMat);
+        this.rightGroup.add(this.innerFill);
+        const dotGeo = new THREE.CircleGeometry(5, 16);
+        const dotMat = new THREE.MeshBasicMaterial({ color: C_INK_DARK, transparent: true, opacity: 0.9, depthWrite: false });
+        this.centerDot = new THREE.Mesh(dotGeo, dotMat);
+        this.rightGroup.add(this.centerDot);
+        this.chordCanvas = document.createElement('canvas');
+        this.chordCanvas.width = 128; this.chordCanvas.height = 64;
+        this.chordTexture = new THREE.CanvasTexture(this.chordCanvas);
+        this.chordTexture.minFilter = THREE.LinearFilter;
+        const chordMat = new THREE.SpriteMaterial({ map: this.chordTexture, transparent: true, depthWrite: false });
+        this.chordSprite = new THREE.Sprite(chordMat);
+        this.chordSprite.scale.set(64, 32, 1);
+        this.rightGroup.add(this.chordSprite);
+        this.rightGroup.position.z = 5;
+        scene.add(this.rightGroup);
+        const pinchRingGeo = new THREE.BufferGeometry();
+        const pinchVerts = 65;
+        const pinchPositions = new Float32Array(pinchVerts * 3);
+        for (let i = 0; i < pinchVerts; i++) {
+          const angle = (i / (pinchVerts - 1)) * Math.PI * 2;
+          pinchPositions[i * 3] = Math.cos(angle); pinchPositions[i * 3 + 1] = Math.sin(angle); pinchPositions[i * 3 + 2] = 0;
+        }
+        pinchRingGeo.setAttribute('position', new THREE.BufferAttribute(pinchPositions, 3));
+        const pinchMat = new THREE.LineBasicMaterial({ color: C_INK_MEDIUM, transparent: true, opacity: 0.7, linewidth: 3, depthWrite: false });
+        this.pinchRing = new THREE.Line(pinchRingGeo, pinchMat);
+        this.pinchRing.visible = false; this.pinchRing.position.z = 5; this.pinchRing.renderOrder = 10;
+        scene.add(this.pinchRing);
+        const thumbGeo = new THREE.CircleGeometry(3, 16);
+        const thumbMat = new THREE.MeshBasicMaterial({ color: C_INK_DARK, transparent: true, opacity: 0.7, depthWrite: false });
+        this.thumbDot = new THREE.Mesh(thumbGeo, thumbMat);
+        this.thumbDot.visible = false; this.thumbDot.position.z = 5; this.thumbDot.renderOrder = 10;
+        scene.add(this.thumbDot);
+      }
+      initLeftHand(scene) {
+        this.leftGroup = new THREE.Group();
+        this.leftGroup.visible = false; this.leftGroup.renderOrder = 10;
+        const ringGeo = new THREE.BufferGeometry();
+        const ringVerts = 65;
+        const ringPositions = new Float32Array(ringVerts * 3);
+        for (let i = 0; i < ringVerts; i++) {
+          const angle = (i / (ringVerts - 1)) * Math.PI * 2;
+          ringPositions[i * 3] = Math.cos(angle) * 22; ringPositions[i * 3 + 1] = Math.sin(angle) * 22; ringPositions[i * 3 + 2] = 0;
+        }
+        ringGeo.setAttribute('position', new THREE.BufferAttribute(ringPositions, 3));
+        const ringMat = new THREE.LineBasicMaterial({ color: C_INK_MEDIUM, transparent: true, opacity: 0.4, depthWrite: false });
+        this.leftRing = new THREE.Line(ringGeo, ringMat);
+        this.leftGroup.add(this.leftRing);
+        this.beatPositions = new Float32Array(8 * 3);
+        this.beatColors = new Float32Array(8 * 4);
+        this.beatSizes = new Float32Array(8);
+        const beatGeo = new THREE.BufferGeometry();
+        const bpAttr = new THREE.BufferAttribute(this.beatPositions, 3); bpAttr.setUsage(THREE.DynamicDrawUsage);
+        const bcAttr = new THREE.BufferAttribute(this.beatColors, 4); bcAttr.setUsage(THREE.DynamicDrawUsage);
+        const bsAttr = new THREE.BufferAttribute(this.beatSizes, 1); bsAttr.setUsage(THREE.DynamicDrawUsage);
+        beatGeo.setAttribute('position', bpAttr);
+        beatGeo.setAttribute('color', bcAttr);
+        beatGeo.setAttribute('size', bsAttr);
+        const beatMat = new THREE.PointsMaterial({ vertexColors: true, transparent: true, depthWrite: false, sizeAttenuation: false, size: 3 });
+        this.beatDots = new THREE.Points(beatGeo, beatMat);
+        this.leftGroup.add(this.beatDots);
+        this.zoneCanvas = document.createElement('canvas');
+        this.zoneCanvas.width = 128; this.zoneCanvas.height = 64;
+        this.zoneTexture = new THREE.CanvasTexture(this.zoneCanvas);
+        this.zoneTexture.minFilter = THREE.LinearFilter;
+        const zoneMat = new THREE.SpriteMaterial({ map: this.zoneTexture, transparent: true, depthWrite: false });
+        this.zoneSprite = new THREE.Sprite(zoneMat);
+        this.zoneSprite.scale.set(40, 20, 1);
+        this.leftGroup.add(this.zoneSprite);
+        this.leftGroup.position.z = 5;
+        scene.add(this.leftGroup);
+      }
+      update(state) { this.updateRightHand(state); this.updateLeftHand(state); }
+      updateRightHand(state) {
+        const rh = state.rightHand;
+        if (!rh.index) { this.rightGroup.visible = false; this.pinchRing.visible = false; this.thumbDot.visible = false; return; }
+        this.rightGroup.visible = true;
+        const pulseSize = 35 + Math.sin(Date.now() * 0.006) * 4;
+        this.rightGroup.position.x = rh.index.x;
+        this.rightGroup.position.y = rh.index.y;
+        this.outerRing.scale.set(pulseSize, pulseSize, 1);
+        this.innerFill.scale.set(pulseSize - 3, pulseSize - 3, 1);
+        const { root, type } = state.currentChord;
+        const suffix = type === 'minor' ? 'm' : type === 'seventh' ? '7' : '';
+        const chordLabel = `${root}${suffix}`;
+        if (chordLabel !== this.lastChordLabel) { this.lastChordLabel = chordLabel; this.renderChordLabel(chordLabel); }
+        this.chordSprite.position.set(0, -pulseSize - 24, 0);
+        if (rh.thumb) {
+          this.pinchRing.visible = true; this.thumbDot.visible = true;
+          const cx = (rh.index.x + rh.thumb.x) / 2;
+          const cy = (rh.index.y + rh.thumb.y) / 2;
+          const radius = Math.hypot(rh.index.x - rh.thumb.x, rh.index.y - rh.thumb.y) / 2;
+          this.pinchRing.position.set(cx, cy, 5);
+          this.pinchRing.scale.set(radius, radius, 1);
+          this.pinchRing.material.opacity = 0.9 - rh.pinch * 0.5;
+          this.thumbDot.position.set(rh.thumb.x, rh.thumb.y, 5);
+          this.thumbDot.material.opacity = 0.5 + (1 - rh.pinch) * 0.4;
+        } else { this.pinchRing.visible = false; this.thumbDot.visible = false; }
+      }
+      updateLeftHand(state) {
+        const lh = state.leftHand;
+        if (!lh.index) { this.leftGroup.visible = false; return; }
+        this.leftGroup.visible = true;
+        this.leftGroup.position.x = lh.index.x;
+        this.leftGroup.position.y = lh.index.y;
+        const isPlaying = state.beatPattern.playing;
+        const ringMat = this.leftRing.material;
+        if (isPlaying) { ringMat.color.copy(C_BEAT_BLUE); ringMat.opacity = 0.8; }
+        else { ringMat.color.copy(C_INK_MEDIUM); ringMat.opacity = 0.4; }
+        if (isPlaying) {
+          this.beatDots.visible = true;
+          const step = state.beatPattern.step;
+          for (let i = 0; i < 8; i++) {
+            const angle = (i / 8) * Math.PI * 2 - Math.PI / 2;
+            const r = 30;
+            this.beatPositions[i * 3] = Math.cos(angle) * r;
+            this.beatPositions[i * 3 + 1] = Math.sin(angle) * r;
+            this.beatPositions[i * 3 + 2] = 0;
+            if (i === step) {
+              this.beatColors[i * 4] = C_BEAT_BLUE.r; this.beatColors[i * 4 + 1] = C_BEAT_BLUE.g;
+              this.beatColors[i * 4 + 2] = C_BEAT_BLUE.b; this.beatColors[i * 4 + 3] = 1;
+            } else {
+              this.beatColors[i * 4] = C_INK_LIGHT.r; this.beatColors[i * 4 + 1] = C_INK_LIGHT.g;
+              this.beatColors[i * 4 + 2] = C_INK_LIGHT.b; this.beatColors[i * 4 + 3] = 0.4;
+            }
+            this.beatSizes[i] = i === step ? 6 : 3;
+          }
+          this.beatDots.geometry.attributes.position.needsUpdate = true;
+          this.beatDots.geometry.attributes.color.needsUpdate = true;
+          this.beatDots.geometry.attributes.size.needsUpdate = true;
+        } else { this.beatDots.visible = false; }
+        const zone = (lh.lastZone ? lh.lastZone.toUpperCase() : '') || '';
+        if (zone !== this.lastZoneLabel) { this.lastZoneLabel = zone; this.renderZoneLabel(zone); }
+      }
+      renderChordLabel(label) {
+        const ctx = this.chordCanvas.getContext('2d');
+        ctx.clearRect(0, 0, 128, 64);
+        ctx.fillStyle = 'rgba(20, 40, 100, 0.8)';
+        ctx.font = '26px Georgia, serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(label, 64, 32);
+        this.chordTexture.needsUpdate = true;
+      }
+      renderZoneLabel(label) {
+        const ctx = this.zoneCanvas.getContext('2d');
+        ctx.clearRect(0, 0, 128, 64);
+        ctx.fillStyle = 'rgba(20, 40, 100, 0.7)';
+        ctx.font = '18px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(label, 64, 32);
+        this.zoneTexture.needsUpdate = true;
+      }
+      dispose() {
+        this.outerRing.geometry.dispose(); this.outerRing.material.dispose();
+        this.innerFill.geometry.dispose(); this.innerFill.material.dispose();
+        this.centerDot.geometry.dispose(); this.centerDot.material.dispose();
+        this.thumbDot.geometry.dispose(); this.thumbDot.material.dispose();
+        this.pinchRing.geometry.dispose(); this.pinchRing.material.dispose();
+        this.chordTexture.dispose(); this.chordSprite.material.dispose();
+        this.leftRing.geometry.dispose(); this.leftRing.material.dispose();
+        this.beatDots.geometry.dispose(); this.beatDots.material.dispose();
+        this.zoneTexture.dispose(); this.zoneSprite.material.dispose();
+      }
+    }
+
+    // ================================================================
+    // RENDERER
+    // ================================================================
+    class ThreeRenderer {
+      constructor(container, video) {
+        this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+        this.renderer.setClearColor(0x000000, 1);
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        this.renderer.toneMapping = THREE.NoToneMapping;
+        container.appendChild(this.renderer.domElement);
+        this.renderer.domElement.style.position = 'absolute';
+        this.renderer.domElement.style.inset = '0';
+        this.camera = new THREE.OrthographicCamera(0, 1, 0, 1, -100, 100);
+        this.scene = new THREE.Scene();
+        this.composer = new EffectComposer(this.renderer);
+        this.composer.addPass(new RenderPass(this.scene, this.camera));
+        const bloomPass = new UnrealBloomPass(
+          new THREE.Vector2(window.innerWidth, window.innerHeight),
+          0.6, 0.4, 0.85
+        );
+        this.composer.addPass(bloomPass);
+        this.composer.addPass(new OutputPass());
+        this.subsystems = [
+          new VideoBackground(video),
+          new TechnicalLineSystem(),
+          new InkTrailSystem(),
+          new InkDotSystem(),
+          new TextLabelSystem(),
+          new CursorSystem(),
+        ];
+        for (const sub of this.subsystems) sub.init(this.scene);
+      }
+      resize(w, h) {
+        this.renderer.setSize(w, h);
+        this.composer.setSize(w, h);
+        this.camera.left = 0; this.camera.right = w; this.camera.top = 0; this.camera.bottom = h;
+        this.camera.updateProjectionMatrix();
+      }
+      render(state) {
+        const dt = 1 / 60;
+        for (const sub of this.subsystems) sub.update(state, dt);
+        this.composer.render();
+      }
+      dispose() {
+        for (const sub of this.subsystems) sub.dispose();
+        this.composer.dispose();
+        this.renderer.dispose();
+        this.renderer.domElement.remove();
+      }
+    }
+
+    // ================================================================
+    // APP STATE + LOGIC (ported from AirInstrument.tsx)
+    // ================================================================
+    let threeRenderer = null;
+    let animationId = 0;
+
+    // Audio
+    let audioCtx = null;
+    let oscillators = [];
+    let gains = [];
+    let masterFilter = null;
+    let masterGain = null;
+    let noiseSource = null;
+
+    let arpIndex = 0;
+    let lastArpTime = 0;
+    let arpSpeed = 200;
+
+    let beatPattern = { playing: false, step: 0, lastTime: 0, type: 'kick' };
+    const beatInterval = 150;
+
+    // Hand tracking
+    let rightHand = { index: null, thumb: null, pinch: 0.5 };
+    let leftHand = { index: null, lastZone: null };
+    let prevRightIndex = null;
+    let isPlaying = false;
+
+    let currentChord = { root: 'C', type: 'major', octave: 4 };
+    let smoothFilter = 2000;
+
+    // Visuals
+    let inkPoints = [];
+    let inkDots = [];
+    let technicalLines = [];
+    let blueRects = [];
+    let flicker = { active: false, intensity: 0 };
+
+    let size = { w: 0, h: 0 };
+
+    const videoEl = document.getElementById('video');
+    const containerEl = document.getElementById('container');
+    const overlayEl = document.getElementById('overlay');
+    const errEl = document.getElementById('err');
+
+    async function startExperience() {
+      if (overlayEl.classList.contains('loading')) return;
+      overlayEl.classList.add('loading');
+      errEl.textContent = '';
+      try {
+        await initAudio();
+        await initMediaPipe();
+        threeRenderer = new ThreeRenderer(containerEl, videoEl);
+        const w = window.innerWidth, h = window.innerHeight;
+        threeRenderer.resize(w, h);
+        size = { w, h };
+        overlayEl.classList.add('hidden');
+        animate();
+      } catch (error) {
+        console.error('Failed to start:', error);
+        overlayEl.classList.remove('loading');
+        errEl.textContent = 'Failed to start: ' + (error && error.message ? error.message : error);
+      }
+    }
+
+    async function initAudio() {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      audioCtx = ctx;
+      const mf = ctx.createBiquadFilter();
+      mf.type = 'lowpass'; mf.frequency.value = 4000; mf.Q.value = 2;
+      masterFilter = mf;
+      const mg = ctx.createGain(); mg.gain.value = 0; masterGain = mg;
+      mf.connect(mg); mg.connect(ctx.destination);
+      for (let i = 0; i < 4; i++) {
+        const osc = ctx.createOscillator();
+        osc.type = i === 0 ? 'sawtooth' : i === 1 ? 'triangle' : i === 2 ? 'square' : 'sine';
+        osc.frequency.value = 220;
+        osc.detune.value = (Math.random() - 0.5) * 10;
+        const gain = ctx.createGain(); gain.gain.value = 0;
+        osc.connect(gain); gain.connect(mf); osc.start();
+        oscillators.push(osc); gains.push(gain);
+      }
+      await createAmbientNoise(ctx);
+    }
+
+    async function createAmbientNoise(ctx) {
+      const bufferSize = ctx.sampleRate * 2;
+      const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < bufferSize; i++) data[i] = (Math.random() * 2 - 1) * 0.006;
+      const src = ctx.createBufferSource();
+      src.buffer = buffer; src.loop = true;
+      const nf = ctx.createBiquadFilter(); nf.type = 'lowpass'; nf.frequency.value = 2000;
+      const ng = ctx.createGain(); ng.gain.value = 0.1;
+      src.connect(nf); nf.connect(ng); ng.connect(ctx.destination); src.start();
+      noiseSource = src;
+    }
+
+    async function initMediaPipe() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+      });
+      videoEl.srcObject = stream;
+      await videoEl.play();
+
+      const HandsCtor = window.Hands;
+      const CameraCtor = window.Camera;
+      if (!HandsCtor || !CameraCtor) {
+        throw new Error('MediaPipe scripts did not load (check your network / CDN).');
+      }
+
+      const hands = new HandsCtor({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+      });
+      hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.7, minTrackingConfidence: 0.5 });
+      hands.onResults(onHandResults);
+
+      const camera = new CameraCtor(videoEl, {
+        onFrame: async () => { if (videoEl) await hands.send({ image: videoEl }); },
+        width: 1280, height: 720,
+      });
+      await camera.start();
+    }
+
+    function onHandResults(results) {
+      const { w, h } = size;
+      if (!w || !h) return;
+      let rightLm = null, leftLm = null;
+      if (results.multiHandLandmarks && results.multiHandedness) {
+        for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+          const lm = results.multiHandLandmarks[i];
+          const handedness = results.multiHandedness[i].label;
+          // Mirror: MediaPipe "Right" maps to the user's left hand on screen
+          if (handedness === 'Right') leftLm = lm; else rightLm = lm;
+        }
+      }
+      processRightHand(rightLm, w, h);
+      processLeftHand(leftLm, w, h);
+    }
+
+    function processRightHand(landmarks, w, h) {
+      if (landmarks) {
+        const idx = landmarks[8], thm = landmarks[4];
+        const newIndex = { x: (1 - idx.x) * w, y: idx.y * h };
+        const prev = prevRightIndex;
+        let velocity = 0;
+        if (prev) {
+          const dx = newIndex.x - prev.x, dy = newIndex.y - prev.y;
+          velocity = Math.sqrt(dx * dx + dy * dy);
+        }
+        rightHand.index = newIndex;
+        rightHand.thumb = { x: (1 - thm.x) * w, y: thm.y * h };
+        prevRightIndex = { x: newIndex.x, y: newIndex.y };
+        const dx = idx.x - thm.x, dy = idx.y - thm.y, dz = (idx.z || 0) - (thm.z || 0);
+        let pinch = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        pinch = Math.max(0.02, Math.min(0.25, pinch));
+        rightHand.pinch = (pinch - 0.02) / 0.23;
+
+        const rootIndex = Math.floor((newIndex.x / w) * ROOT_NOTES.length);
+        const root = ROOT_NOTES[Math.max(0, Math.min(ROOT_NOTES.length - 1, rootIndex))];
+        const yNorm = newIndex.y / h;
+        let chordType = 'major';
+        if (yNorm > 0.66) chordType = 'seventh';
+        else if (yNorm > 0.33) chordType = 'minor';
+        currentChord = { root, type: chordType, octave: 4 };
+
+        const pressure = Math.max(0.4, Math.min(1, 1.2 - velocity / 80));
+        inkPoints.push({ x: newIndex.x, y: newIndex.y, age: 0, pressure, velocity });
+
+        if (Math.random() < 0.4 + velocity * 0.01) {
+          const offsetX = (Math.random() - 0.5) * (20 + velocity * 0.5);
+          const offsetY = (Math.random() - 0.5) * (20 + velocity * 0.5);
+          inkDots.push({
+            x: newIndex.x + offsetX, y: newIndex.y + offsetY,
+            size: Math.max(1, 2 + Math.random() * 4 - velocity * 0.05), age: 0,
+          });
+        }
+
+        if (velocity > 12 && prev) {
+          const baseAngle = Math.atan2(newIndex.y - prev.y, newIndex.x - prev.x);
+          for (let i = 0; i < Math.min(4, Math.floor(velocity / 15)); i++) {
+            const angle = baseAngle + (Math.random() - 0.5) * Math.PI * 0.6;
+            const length = 60 + Math.random() * 120 + velocity;
+            technicalLines.push({
+              x1: newIndex.x, y1: newIndex.y,
+              x2: newIndex.x + Math.cos(angle) * length, y2: newIndex.y + Math.sin(angle) * length,
+              age: 0, style: Math.random() > 0.7 ? 'dashed' : 'solid',
+            });
+          }
+          if (Math.random() < 0.08) {
+            blueRects.push({
+              x: newIndex.x + (Math.random() - 0.5) * 100, y: newIndex.y + (Math.random() - 0.5) * 100,
+              w: 40 + Math.random() * 80, h: 30 + Math.random() * 60, age: 0,
+            });
+          }
+        }
+        isPlaying = true;
+      } else {
+        rightHand.index = null; rightHand.thumb = null; isPlaying = false;
+      }
+    }
+
+    function processLeftHand(landmarks, w, h) {
+      if (landmarks) {
+        const idx = landmarks[8];
+        const pos = { x: (1 - idx.x) * w, y: idx.y * h };
+        leftHand.index = pos;
+        const yNorm = pos.y / h;
+        let zone;
+        if (yNorm < 0.33) zone = 'hat';
+        else if (yNorm < 0.66) zone = 'snare';
+        else zone = 'kick';
+        if (zone !== leftHand.lastZone) {
+          beatPattern = { playing: true, step: 0, lastTime: performance.now(), type: zone };
+        }
+        leftHand.lastZone = zone;
+      } else {
+        leftHand.index = null; leftHand.lastZone = null; beatPattern.playing = false;
+      }
+    }
+
+    function triggerDrum(type) {
+      const ctx = audioCtx;
+      if (!ctx) return;
+      const now = ctx.currentTime;
+      if (type === 'kick') {
+        const osc = ctx.createOscillator(), gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(120, now);
+        osc.frequency.exponentialRampToValueAtTime(35, now + 0.12);
+        gain.gain.setValueAtTime(0.7, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+        osc.connect(gain); gain.connect(ctx.destination);
+        osc.start(now); osc.stop(now + 0.25);
+      } else if (type === 'snare') {
+        const bufferSize = ctx.sampleRate * 0.12;
+        const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let i = 0; i < bufferSize; i++) data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufferSize * 0.15));
+        const src = ctx.createBufferSource(); src.buffer = buffer;
+        const gain = ctx.createGain(); gain.gain.setValueAtTime(0.4, now);
+        const filter = ctx.createBiquadFilter(); filter.type = 'highpass'; filter.frequency.value = 800;
+        src.connect(filter); filter.connect(gain); gain.connect(ctx.destination); src.start(now);
+      } else if (type === 'hat') {
+        const bufferSize = ctx.sampleRate * 0.04;
+        const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let i = 0; i < bufferSize; i++) data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufferSize * 0.08));
+        const src = ctx.createBufferSource(); src.buffer = buffer;
+        const gain = ctx.createGain(); gain.gain.setValueAtTime(0.25, now);
+        const filter = ctx.createBiquadFilter(); filter.type = 'highpass'; filter.frequency.value = 6000;
+        src.connect(filter); filter.connect(gain); gain.connect(ctx.destination); src.start(now);
+      }
+    }
+
+    function updateBeatPattern(now) {
+      const beat = beatPattern;
+      if (!beat.playing) return;
+      if (now - beat.lastTime > beatInterval) {
+        beat.lastTime = now;
+        beat.step = (beat.step + 1) % 8;
+        const pattern = BEAT_PATTERNS[beat.type];
+        if (pattern[beat.step] === 1) triggerDrum(beat.type);
+      }
+    }
+
+    function getChordFrequencies(root, type, octave) {
+      const intervals = CHORD_INTERVALS[type] || CHORD_INTERVALS.major;
+      const rootFreq = NOTE_FREQUENCIES[`${root}${octave}`] || 261.63;
+      return intervals.map(interval => rootFreq * Math.pow(2, interval / 12));
+    }
+
+    function updateAudio() {
+      const ctx = audioCtx;
+      const rh = rightHand;
+      if (!ctx) return;
+      const now = performance.now();
+      const pinch = rh.pinch;
+      arpSpeed = 100 + (1 - pinch) * 200;
+      if (rh.index && isPlaying) {
+        const { root, type, octave } = currentChord;
+        const frequencies = getChordFrequencies(root, type, octave);
+        if (now - lastArpTime > arpSpeed) {
+          lastArpTime = now;
+          arpIndex = (arpIndex + 1) % frequencies.length;
+          flicker = { active: true, intensity: 1 };
+        }
+        const t = ctx.currentTime;
+        oscillators.forEach((osc, i) => {
+          const freq = frequencies[i % frequencies.length];
+          osc.frequency.setTargetAtTime(freq, t, 0.05);
+        });
+        gains.forEach((gain, i) => {
+          const isCurrentNote = i === arpIndex;
+          gain.gain.setTargetAtTime(isCurrentNote ? 0.18 : 0.05, t, 0.02);
+        });
+        const targetFilter = 200 + pinch * 8000;
+        smoothFilter += (targetFilter - smoothFilter) * 0.08;
+        if (masterFilter) {
+          masterFilter.frequency.setTargetAtTime(smoothFilter, t, 0.02);
+          masterFilter.Q.setTargetAtTime(1 + (1 - pinch) * 4, t, 0.02);
+        }
+        if (masterGain) masterGain.gain.setTargetAtTime(0.45, t, 0.02);
+      } else {
+        if (masterGain) masterGain.gain.setTargetAtTime(0, ctx.currentTime, 0.1);
+      }
+      updateBeatPattern(now);
+    }
+
+    function animate() {
+      const renderer = threeRenderer;
+      const { w, h } = size;
+      if (!renderer || !w) { animationId = requestAnimationFrame(animate); return; }
+      updateAudio();
+      if (flicker.active) {
+        flicker.intensity *= 0.85;
+        if (flicker.intensity < 0.05) flicker.active = false;
+      }
+      inkPoints = inkPoints.map(p => ({ ...p, age: p.age + 0.3 })).filter(p => p.age < MAX_INK_AGE);
+      inkDots = inkDots.map(d => ({ ...d, age: d.age + 0.5 })).filter(d => d.age < 400);
+      technicalLines = technicalLines.map(l => ({ ...l, age: l.age + 0.8 })).filter(l => l.age < 350);
+      blueRects = blueRects.map(r => ({ ...r, age: r.age + 1 })).filter(r => r.age < 400);
+      const state = {
+        width: w, height: h,
+        inkPoints, inkDots, technicalLines, blueRects,
+        flicker: { ...flicker },
+        rightHand: {
+          index: rightHand.index ? { ...rightHand.index } : null,
+          thumb: rightHand.thumb ? { ...rightHand.thumb } : null,
+          pinch: rightHand.pinch,
+        },
+        leftHand: { index: leftHand.index ? { ...leftHand.index } : null, lastZone: leftHand.lastZone },
+        beatPattern: { ...beatPattern },
+        currentChord: { ...currentChord },
+      };
+      renderer.render(state);
+      animationId = requestAnimationFrame(animate);
+    }
+
+    // Resize
+    function onResize() {
+      const w = window.innerWidth, h = window.innerHeight;
+      size = { w, h };
+      if (threeRenderer) threeRenderer.resize(w, h);
+    }
+    window.addEventListener('resize', onResize);
+    onResize();
+
+    // Wire up start
+    overlayEl.addEventListener('click', startExperience);
+  </script>
+</body>
+</html>
