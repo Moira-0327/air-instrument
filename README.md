@@ -13,6 +13,22 @@ the camera, and raise your hands.
 
 _Scan the QR to open the demo on your phone._
 
+## Download the code
+
+**Easiest — ZIP (no tools needed):**
+1. Go to https://github.com/Moira-0327/air-instrument
+2. Click the green **`< > Code`** button → **Download ZIP**
+3. Unzip, then double-click `index.html`.
+
+Direct ZIP link: https://github.com/Moira-0327/air-instrument/archive/refs/heads/main.zip
+
+**Or clone (for editing / commits):**
+```bash
+git clone https://github.com/Moira-0327/air-instrument.git
+cd air-instrument
+open index.html      # macOS · on Windows just double-click index.html
+```
+
 ## Run it (30 seconds)
 
 You have internet? That's all you need.
