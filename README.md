@@ -83,3 +83,7 @@ desktop; mobile is hit-or-miss due to camera + performance.
 | Blank / black screen | Check you have internet (CDN libs). Open DevTools console for errors. |
 | No sound | Click/interact once first — browsers block audio until a user gesture. |
 | Laggy | Close other tabs; good lighting helps hand tracking; use Chrome. |
+
+##Figam Jem
+https://www.figma.com/board/1RgaizvVDlqC8NXAOOA5ud/gesture-pipeline?node-id=0-1&p=f&t=m5o01Mn8IOAVowdv-0
+
